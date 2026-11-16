@@ -1,6 +1,6 @@
 # Invoke-BitwardenDump
 
-Post-exploitation tool for extracting Bitwarden desktop vault credentials on Windows. Pure PowerShell + .NET P/Invoke — zero external dependencies, single file.
+Post-exploitation tool for extracting Bitwarden vault credentials on Windows — desktop app AND browser extensions (Chrome, Brave, Edge, Firefox, Vivaldi). Pure PowerShell + .NET P/Invoke — zero external dependencies, single file.
 
 ## Disclaimer
 
@@ -27,7 +27,7 @@ Credential Manager (DPAPI) → UserKey (64B)
 | Mode | Description |
 |------|-------------|
 | `-Recon` | Enumerate Bitwarden processes, desktop app version, `data.json` analysis, browser extensions (Chrome/Brave/Edge/Firefox), Credential Manager entries, LevelDB key scan, attack path recommendations |
-| `-Dump` | Live memory dump of the Bitwarden renderer process — extracts plaintext credentials via regex pattern matching (URL/username/password proximity, JSON structures) |
+| `-Dump` | Live memory dump of Bitwarden desktop **and browser extension** processes (Chrome, Brave, Edge, Firefox, Vivaldi) — auto-detects browsers with the extension installed, scans top renderer processes for plaintext credentials |
 | `-Offline` | **Primary attack** — Extracts UserKey from Credential Manager, decrypts RSA private key, then decrypts all cached vault ciphers from `data.json`. Works when auto-unlock is enabled (vault timeout = "never") |
 | `-ParseDump` | Parse a previously saved memory dump file for credentials |
 | `-All` | Full chain: Recon → auto-select best attack (Offline if auto-unlock key found, Dump otherwise) |
@@ -118,7 +118,7 @@ user_{uid}_kdfConfig_kdfConfig → KDF parameters
 For blue teams — indicators of this technique:
 - Process accessing `Bitwarden_auto/*` credential entries via `CredRead`/`CredEnumerate`
 - Non-Bitwarden process reading `%APPDATA%\Bitwarden\data.json`
-- `ReadProcessMemory` calls targeting Bitwarden.exe from an external process
+- `ReadProcessMemory` calls targeting Bitwarden.exe or browser processes from an external process
 - PowerShell loading `Add-Type` with `System.Runtime.InteropServices` for credential/memory APIs
 
 ## Mitigations
